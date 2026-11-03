@@ -1,0 +1,39 @@
+name: Setup Swale CLI
+description: Install the Swale CLI and add it to the PATH, after verifying the release's signature and checksum.
+author: Swale IO, Inc.
+branding:
+  icon: terminal
+  color: green
+
+inputs:
+  version:
+    description: The Swale CLI version to install, such as 1.0.1, or latest.
+    required: false
+    default: latest
+
+outputs:
+  version:
+    description: The Swale CLI version installed.
+    value: ${{ steps.unix.outputs.version || steps.windows.outputs.version }}
+  path:
+    description: The full path of the installed swale binary.
+    value: ${{ steps.unix.outputs.path || steps.windows.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    # sh, which every container image has and bash is not; Windows has no sh
+    # shell, so it runs the same script under Git Bash.
+    - id: unix
+      if: runner.os != 'Windows'
+      shell: sh
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: sh "$GITHUB_ACTION_PATH/install.sh"
+
+    - id: windows
+      if: runner.os == 'Windows'
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: bash "$GITHUB_ACTION_PATH/install.sh"

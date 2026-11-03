@@ -1,0 +1,46 @@
+name: Move the major tag
+
+# Points a release's major tag (v1 for v1.2.0) at its commit, so @v1 follows
+# the newest 1.x release. The job runs in the release environment, whose
+# approval is what moves the tag. Run by hand from a release tag, it points the
+# major tag back at that release.
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: move-major-tag
+  cancel-in-progress: false
+
+jobs:
+  move:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      # A fix released for an older minor leaves the major tag on the newer one.
+      - name: Move the major tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || github.ref_name }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || { echo "::error::${TAG} is not a release tag like v1.2.0."; exit 1; }
+          major=${TAG%%.*}
+          if [[ "$EVENT" == release ]]; then
+            newest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' | grep -E "^${major}[.][0-9]+[.][0-9]+$" | sort -V | tail -n 1)
+            [[ "$TAG" == "$newest" ]] || { echo "::notice::${TAG} is older than ${newest}, so ${major} stays on ${newest}."; exit 0; }
+          fi
+          commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$major" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" -f sha="$commit" -F force=true > /dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$major" -f sha="$commit" > /dev/null
+          fi
+          echo "${major} now points at ${TAG} (${commit})."

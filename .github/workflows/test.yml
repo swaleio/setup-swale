@@ -1,0 +1,254 @@
+name: Test the action
+
+# Runs the action the way workflows use it, on every runner type it serves and
+# in containers, and checks it refuses what it must not install. Weekly too,
+# since latest moves with each CLI release without a change here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    name: Install on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-15
+          - macos-15-intel
+          - windows-latest
+          - windows-11-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install a pinned version
+        id: pinned
+        uses: ./
+        with:
+          version: 1.0.0
+
+      - name: Check the pinned version
+        shell: bash
+        env:
+          VERSION: ${{ steps.pinned.outputs.version }}
+          BIN: ${{ steps.pinned.outputs.path }}
+        run: |
+          [[ "$VERSION" == "1.0.0" ]] || { echo "::error::The version output is ${VERSION}, not 1.0.0."; exit 1; }
+          reported=$(swale --version)
+          [[ "$reported" == "1.0.0" ]] || { echo "::error::swale on the PATH reports ${reported}, not 1.0.0."; exit 1; }
+          reported=$("$BIN" --version)
+          [[ "$reported" == "1.0.0" ]] || { echo "::error::The path output reports ${reported}, not 1.0.0."; exit 1; }
+
+      - name: Install the latest version
+        id: latest
+        uses: ./
+
+      # The latest release, read from where the action reads it.
+      - name: Check the latest version
+        shell: bash
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          location=$(curl -fsSI -o /dev/null -w '%{redirect_url}' https://github.com/swaleio/swale-cli/releases/latest)
+          expected=${location##*/v}
+          [[ "$VERSION" == "$expected" ]] || { echo "::error::The version output is ${VERSION}, the latest release is ${expected}."; exit 1; }
+          reported=$(swale --version)
+          [[ "$reported" == "$expected" ]] || { echo "::error::swale on the PATH reports ${reported}, the latest release is ${expected}."; exit 1; }
+
+  container:
+    name: Install in ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl, with busybox's sh and wget and no bash or curl.
+          - image: alpine:3.22
+            prepare: apk add --no-cache gnupg
+          - image: debian:stable-slim
+            prepare: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install gpg
+        run: ${{ matrix.prepare }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install
+        id: install
+        uses: ./
+
+      - name: Check the version
+        env:
+          VERSION: ${{ steps.install.outputs.version }}
+        run: |
+          reported=$(swale --version)
+          [ -n "$VERSION" ] && [ "$reported" = "$VERSION" ] || { echo "::error::swale reports ${reported}, the action installed ${VERSION}."; exit 1; }
+
+  # Runs the script directly under sh, which is dash here as on Debian and
+  # Ubuntu, so the reason it stops can be checked as well as the stop. Its
+  # output is printed with workflow commands off, so the error it was expected
+  # to raise does not mark the run.
+  verifies:
+    name: ${{ matrix.case }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: Refuse a malformed version
+            version: "1.0"
+            expect: is not a version like 1.0.1
+          - case: Refuse a version with a line break
+            version: "1.0.0\nlatest"
+            expect: is not a version like 1.0.1
+          - case: Refuse a version never released
+            version: 0.0.1
+            expect: no release found
+          - case: Refuse a signature by a second key in the key file
+            version: 1.0.0
+            forgery: second-key
+            expect: is not signed by
+          - case: Refuse a second key whose user ID imitates a status line
+            version: 1.0.0
+            forgery: injected-user-id
+            expect: is not signed by
+          - case: Refuse a signature by a revoked key
+            version: 1.0.0
+            forgery: revoked-key
+            expect: signed by a revoked key
+          - case: Accept a signature by an expired subkey
+            version: 1.0.0
+            forgery: expired-subkey
+            installs: true
+            expect: Installed swale 1.0.0
+          - case: Refuse another release's signed manifest
+            version: 1.0.0
+            forgery: replayed-manifest
+            expect: carries the manifest of 1.0.1
+          - case: Refuse a swapped binary with its checksum changed in the manifest
+            version: 1.0.0
+            forgery: changed-manifest
+            expect: signature is not valid
+          - case: Refuse a swapped binary
+            version: 1.0.0
+            forgery: changed-binary
+            expect: checksum mismatch
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A copy of the release on disk, forged one way, and a copy of the
+      # installer that reads the release and the key from there. The revoked
+      # and expired cases sign with a key of their own, whose fingerprint the
+      # copy embeds in place of Swale's, and which signs in the past.
+      - name: Forge the release
+        if: matrix.forgery != ''
+        env:
+          FORGERY: ${{ matrix.forgery }}
+        run: |
+          fixture="$RUNNER_TEMP/forged"
+          rel="$fixture/download/v1.0.0"
+          real=https://github.com/swaleio/swale-cli/releases/download
+          mkdir -p "$rel"
+          curl -fsSL https://swale.io/.well-known/pgp-key.txt -o "$fixture/key.asc"
+          source=v1.0.0
+          if [[ "$FORGERY" == replayed-manifest ]]; then source=v1.0.1; fi
+          curl -fsSL "$real/$source/manifest.json" -o "$rel/manifest.json"
+          curl -fsSL "$real/$source/manifest.json.sig" -o "$rel/manifest.json.sig"
+          echo forged > "$rel/swale-cli-linux-x64"
+          fingerprint=F52CF38130C597453BE6BD7DD65BF0C473F6E965
+          GNUPGHOME=$(mktemp -d)
+          export GNUPGHOME
+          case "$FORGERY" in
+            second-key | injected-user-id)
+              uid='Forger <forger@example.com>'
+              if [[ "$FORGERY" == injected-user-id ]]; then uid="Forger\\n[GNUPG:] VALIDSIG 0 2026-01-01 0 0 4 0 22 10 00 $fingerprint"; fi
+              gpg --batch --passphrase '' --quick-gen-key "$uid" ed25519 sign never
+              gpg --armor --export >> "$fixture/key.asc"
+              gpg --batch --yes --detach-sign -o "$rel/manifest.json.sig" "$rel/manifest.json"
+              ;;
+            revoked-key | expired-subkey)
+              created='20250101T000000!'
+              gpg --batch --passphrase '' --faked-system-time "$created" --quick-gen-key 'Test signer <test@example.com>' ed25519 cert never
+              fingerprint=$(gpg --list-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')
+              expiry=never
+              if [[ "$FORGERY" == expired-subkey ]]; then expiry=1d; fi
+              gpg --batch --passphrase '' --faked-system-time "$created" --quick-add-key "$fingerprint" ed25519 sign "$expiry"
+              gpg --batch --yes --faked-system-time '20250101T120000!' --detach-sign -o "$rel/manifest.json.sig" "$rel/manifest.json"
+              if [[ "$FORGERY" == revoked-key ]]; then
+                sed 's/^:-----BEGIN/-----BEGIN/' "$GNUPGHOME/openpgp-revocs.d/$fingerprint.rev" | gpg --batch --import
+              else
+                curl -fsSL "$real/v1.0.0/swale-cli-linux-x64" -o "$rel/swale-cli-linux-x64"
+              fi
+              gpg --armor --export "$fingerprint" > "$fixture/key.asc"
+              ;;
+            changed-manifest)
+              sum=$(sha256sum "$rel/swale-cli-linux-x64" | cut -d ' ' -f 1)
+              sed -i "/\"linux-x64\"/,/}/ s/\"checksum\": \"[0-9a-f]*\"/\"checksum\": \"$sum\"/" "$rel/manifest.json"
+              grep -q "$sum" "$rel/manifest.json"
+              ;;
+          esac
+          sed -e "s#^RELEASES=.*#RELEASES=\"file://$fixture\"#" -e "s#^KEY_URL=.*#KEY_URL=\"file://$fixture/key.asc\"#" \
+            -e "s#^FINGERPRINT=.*#FINGERPRINT=\"$fingerprint\"#" install.sh > "$RUNNER_TEMP/install-forged.sh"
+          [[ $(grep -c -e "file://$fixture" -e "^FINGERPRINT=\"$fingerprint\"" "$RUNNER_TEMP/install-forged.sh") == 3 ]]
+          echo "INSTALLER=$RUNNER_TEMP/install-forged.sh" >> "$GITHUB_ENV"
+
+      - name: Run the installer
+        env:
+          INPUT_VERSION: ${{ matrix.version }}
+          INSTALLS: ${{ matrix.installs || false }}
+          EXPECT: ${{ matrix.expect }}
+        run: |
+          status=0
+          output=$(sh "${INSTALLER:-./install.sh}" 2>&1) || status=$?
+          echo "::stop-commands::installer-output"
+          echo "$output"
+          echo "::installer-output::"
+          if [[ "$INSTALLS" == true ]]; then
+            [[ $status -eq 0 ]] || { echo "::error::The installer refused it."; exit 1; }
+          else
+            [[ $status -ne 0 ]] || { echo "::error::The installer accepted it."; exit 1; }
+          fi
+          [[ "$output" == *"$EXPECT"* ]] || { echo "::error::The installer did not report '${EXPECT}'."; exit 1; }
+
+  refuses-without-gpg:
+    name: Refuse without gpg
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: debian:stable-slim
+    steps:
+      - name: Install curl only
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run the installer
+        run: |
+          status=0
+          output=$(sh ./install.sh 2>&1) || status=$?
+          echo "::stop-commands::installer-output"
+          echo "$output"
+          echo "::installer-output::"
+          [ "$status" -ne 0 ] || { echo "::error::The installer installed without gpg."; exit 1; }
+          case "$output" in
+            *"needs gpg"*) ;;
+            *) echo "::error::The installer stopped for another reason than the missing gpg."; exit 1 ;;
+          esac
